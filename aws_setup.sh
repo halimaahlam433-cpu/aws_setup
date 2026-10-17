@@ -301,5 +301,5 @@ systemctl status realm --no-pager || true
 
 echo -e "\n========================================="
 echo "所有初始化、Realm (${REALM_ARCH}) 部署、资源解锁与网络参数优化已全部自动完成！"
-echo "SSH 端口: ${SSH_PORT} | 转发端口: 10001-10003 | LimitNOFILE: ${SOFT_NOFILE}/${HARD_NOFILE}"
+echo "SSH 端口: ${SSH_PORT} | LimitNOFILE: ${SOFT_NOFILE}/${HARD_NOFILE}"
 echo "========================================="
