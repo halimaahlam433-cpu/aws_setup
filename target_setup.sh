@@ -7,6 +7,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+SSH_PORT=53152
+
 echo "========================================="
 echo "开始执行 target_setup 初始化与系统优化..."
 echo "========================================="
@@ -14,24 +16,47 @@ echo "========================================="
 # ==========================================
 # 阶段一：基础软件与安全初始化
 # ==========================================
-echo "--> 正在更新软件源并安装 curl, fail2ban..."
-apt update
-apt install -y curl fail2ban
+echo "--> 正在更新软件源并安装基础组件..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y curl fail2ban python3-systemd
 
-# 修改 SSH 端口为 53152
+echo "--> 正在修改 SSH 端口为 ${SSH_PORT}..."
 if grep -q "^#\?Port " /etc/ssh/sshd_config; then
-    sed -i 's/^#\?Port .*/Port 53152/' /etc/ssh/sshd_config
+    sed -i "s/^#\?Port .*/Port ${SSH_PORT}/" /etc/ssh/sshd_config
 else
-    echo "Port 53152" | tee -a /etc/ssh/sshd_config
+    echo "Port ${SSH_PORT}" >> /etc/ssh/sshd_config
 fi
 
-# 重启 SSH 服务使配置生效
-systemctl restart ssh
+# 兼容通过 sshd_config.d 覆盖配置的系统
+mkdir -p /etc/ssh/sshd_config.d
+echo "Port ${SSH_PORT}" > /etc/ssh/sshd_config.d/99-custom-port.conf
 
-# 配置并启动 Fail2Ban
+# 校验 SSH 配置无误后再重启服务
+sshd -t
+systemctl daemon-reload
+if systemctl is-active --quiet ssh.socket; then
+    systemctl stop ssh.socket
+    systemctl disable ssh.socket
+fi
+systemctl restart ssh || systemctl restart sshd
+
+echo "--> 正在配置并启动 Fail2Ban (监听端口 ${SSH_PORT})..."
+cat <<EOF > /etc/fail2ban/jail.local
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+backend = systemd
+
+[sshd]
+enabled = true
+port = ${SSH_PORT}
+EOF
+
 systemctl enable fail2ban
-systemctl start fail2ban
-systemctl status fail2ban --no-pager
+systemctl restart fail2ban
+systemctl status fail2ban --no-pager || true
 
 # ==========================================
 # 阶段二：获取系统硬件配置
@@ -48,12 +73,11 @@ echo "检测到系统配置: ${CPU_CORES} 核心 CPU, 内存约为 ${MEM_GB} GB 
 # ==========================================
 # 阶段三：设置系统连接与进程限制 (确保服务零报错)
 # ==========================================
-# 软限制设为 65536 保证老旧程序兼容性，硬限制固定 1048576 确保任何高并发服务不会因权限不足启动失败
 SOFT_NOFILE=65536
 HARD_NOFILE=1048576
 LIMIT_NPROC=65535
 
-echo "正在配置 systemd 资源限制..."
+echo "--> 正在配置 systemd 资源限制..."
 
 SYSTEMD_CONF="[Manager]
 DefaultLimitNOFILE=${SOFT_NOFILE}:${HARD_NOFILE}
@@ -67,7 +91,6 @@ mkdir -p /etc/systemd/user.conf.d
 echo "$SYSTEMD_CONF" > /etc/systemd/system.conf.d/99-custom-limits.conf
 echo "$SYSTEMD_CONF" > /etc/systemd/user.conf.d/99-custom-limits.conf
 
-# 补充 PAM limits (修复通配符 * 与变量换行错误)
 mkdir -p /etc/security/limits.d
 
 cat <<EOF > /etc/security/limits.d/99-conns.conf
@@ -89,17 +112,21 @@ echo -e "\n--> 正在配置网络优化参数..."
 modprobe tcp_bbr 2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
 
-# (1) 系统级文件句柄总数与单进程上限
-# 关键保证：fs.nr_open 绝不低于 1048576，防止 systemd 服务因 LimitNOFILE 过高而启动失败
+# (1) 系统级文件句柄总数与单进程上限 (使用 if 避免触发 set -e 退出)
 FILE_MAX=$((MEM_MB * 512))
-[[ $FILE_MAX -lt 1048576 ]] && FILE_MAX=1048576
+if [[ $FILE_MAX -lt 1048576 ]]; then
+    FILE_MAX=1048576
+fi
+
 NR_OPEN=1048576
-[[ $FILE_MAX -gt $NR_OPEN ]] && NR_OPEN=2097152
+if [[ $FILE_MAX -gt $NR_OPEN ]]; then
+    NR_OPEN=2097152
+fi
 
 # (2) Swap 倾向
-if [ "$MEM_MB" -le 1024 ]; then
+if [[ $MEM_MB -le 1024 ]]; then
     SWAPPINESS=30
-elif [ "$MEM_MB" -ge 4096 ]; then
+elif [[ $MEM_MB -ge 4096 ]]; then
     SWAPPINESS=1
 else
     SWAPPINESS=10
@@ -107,22 +134,32 @@ fi
 
 # (3) TCP 核心缓冲区 (最大值，单位：字节)
 TCP_MEM_MAX=$((MEM_MB * 8192))
-[[ $TCP_MEM_MAX -lt 8388608 ]] && TCP_MEM_MAX=8388608
-[[ $TCP_MEM_MAX -gt 134217728 ]] && TCP_MEM_MAX=134217728
+if [[ $TCP_MEM_MAX -lt 8388608 ]]; then
+    TCP_MEM_MAX=8388608
+elif [[ $TCP_MEM_MAX -gt 134217728 ]]; then
+    TCP_MEM_MAX=134217728
+fi
 
 # (4) 队列连接并发与积压限制
 SOMAXCONN=$((MEM_MB * 8))
 MAX_PER_CORE=$((CPU_CORES * 16384))
 
-[[ $SOMAXCONN -gt $MAX_PER_CORE ]] && SOMAXCONN=$MAX_PER_CORE
-[[ $SOMAXCONN -lt 4096 ]] && SOMAXCONN=4096
-[[ $SOMAXCONN -gt 65535 ]] && SOMAXCONN=65535
+if [[ $SOMAXCONN -gt $MAX_PER_CORE ]]; then
+    SOMAXCONN=$MAX_PER_CORE
+fi
+if [[ $SOMAXCONN -lt 4096 ]]; then
+    SOMAXCONN=4096
+elif [[ $SOMAXCONN -gt 65535 ]]; then
+    SOMAXCONN=65535
+fi
 
 BACKLOG=$((SOMAXCONN / 2))
 
 # (5) 路由与连接跟踪 (Conntrack)
 CONNTRACK_MAX=$((MEM_MB * 256))
-[[ $CONNTRACK_MAX -lt 131072 ]] && CONNTRACK_MAX=131072
+if [[ $CONNTRACK_MAX -lt 131072 ]]; then
+    CONNTRACK_MAX=131072
+fi
 
 mkdir -p /etc/sysctl.d
 CONF_FILE="/etc/sysctl.d/99-dynamic-network.conf"
@@ -193,15 +230,14 @@ vm.dirty_background_ratio = 5
 vm.dirty_ratio = 15
 EOF
 
-echo "应用 sysctl 配置..."
-# 先应用 sysctl 提高内核 fs.nr_open 上限，再重载 systemd，顺序不可颠倒
+echo "--> 应用 sysctl 配置..."
 sysctl -e -p "$CONF_FILE"
 
-echo "重载 systemd 守护进程..."
+echo "--> 重载 systemd 守护进程..."
 systemctl daemon-reload
 systemctl daemon-reexec
 
 echo -e "\n========================================="
 echo "初始化及优化已全部完成！"
-echo "软/硬限制已设置为 ${SOFT_NOFILE}/${HARD_NOFILE}，网络已适配 ${CPU_CORES}C${MEM_GB}G。"
+echo "SSH 端口已改为 ${SSH_PORT}，软/硬限制已设置为 ${SOFT_NOFILE}/${HARD_NOFILE}，网络已适配 ${CPU_CORES}C${MEM_GB}G。"
 echo "========================================="
